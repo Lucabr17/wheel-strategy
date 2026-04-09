@@ -1,18 +1,44 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
-import os
+import numpy as np
 import yfinance as yf 
+import gspread # NEW: Google Sheets Library
+import json # NEW: To read the secrets
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Wheel Strategy Log", layout="wide") 
 
-FILE_NAME = "trades_data.csv" 
+# --- NEW: GOOGLE SHEETS SETUP ---
+# Connect to Google Sheets using the Streamlit Secrets
+@st.cache_resource
+def init_gsheets():
+    creds_dict = json.loads(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(creds_dict)
+    sh = gc.open("Wheel Trades Database")
+    return sh.sheet1
 
-# --- INITIALIZE DATA & LOAD FROM FILE ---
+worksheet = init_gsheets()
+
+# Function to save data back to Google Sheets
+def save_to_cloud(df):
+    df_save = df.copy()
+    # Google Sheets doesn't like NaN/NaT, so we replace them with empty strings
+    df_save = df_save.fillna("")
+    for col in ['Open Date', 'Expiration Date', 'Close Date']:
+        df_save[col] = df_save[col].astype(str).replace('NaT', '')
+    
+    worksheet.clear()
+    # Update the sheet with headers + data
+    worksheet.update(values=[df_save.columns.values.tolist()] + df_save.values.tolist(), range_name='A1')
+
+# --- INITIALIZE DATA FROM CLOUD ---
 if 'trades' not in st.session_state:
-    if os.path.exists(FILE_NAME): 
-        loaded_df = pd.read_csv(FILE_NAME)
+    records = worksheet.get_all_records()
+    if records: 
+        loaded_df = pd.DataFrame(records)
+        # Convert empty strings back to Pandas empty values
+        loaded_df.replace("", np.nan, inplace=True)
         for col in ['Open Date', 'Expiration Date', 'Close Date']:
             loaded_df[col] = pd.to_datetime(loaded_df[col])
         st.session_state.trades = loaded_df
@@ -59,7 +85,7 @@ for idx, row in st.session_state.trades.iterrows():
             pass 
 
 if changed:
-    st.session_state.trades.to_csv(FILE_NAME, index=False)
+    save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
 
 df = st.session_state.trades
 
@@ -229,7 +255,7 @@ if st.session_state.show_form:
                     }
                     st.session_state.trades = pd.concat([st.session_state.trades, pd.DataFrame([new_data])], ignore_index=True)
                 
-                st.session_state.trades.to_csv(FILE_NAME, index=False)
+                save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
                 st.session_state.edit_idx = None
                 st.session_state.show_form = False
                 st.rerun()
@@ -331,7 +357,6 @@ tabs = st.tabs([
     f"Rolled ({count_rolled})"
 ])
 
-# ADDED tab_key parameter here
 def display_custom_table(filtered_df, tab_key=""):
     if filtered_df.empty:
         st.info("No trades found in this category.")
@@ -345,7 +370,6 @@ def display_custom_table(filtered_df, tab_key=""):
         except:
             current_prices[t] = 0.0
 
-    # Draw Table Header
     cols = st.columns([1.2, 1, 1.3, 1.2, 1.2, 1.2, 1.2, 1.5, 1, 1.2, 1.2])
     headers = ["Open Date", "Ticker", "Strategy", "Strike", "Cur. Price", "Premium", "P&L", "Exp/Close Date", "Days Left", "Status", "Actions"]
     for col, header in zip(cols, headers):
@@ -353,11 +377,9 @@ def display_custom_table(filtered_df, tab_key=""):
     
     st.divider()
 
-    # Draw Each Row
     for i, row in filtered_df.iterrows():
         cols = st.columns([1.2, 1, 1.3, 1.2, 1.2, 1.2, 1.2, 1.5, 1, 1.2, 1.2])
         
-        # Format Variables
         open_d = row['Open Date'].strftime('%Y-%m-%d')
         ticker = row['Ticker']
         strategy = "CSP" if row['Strategy'] == "Cash-Secured Put" else "CC"
@@ -371,7 +393,6 @@ def display_custom_table(filtered_df, tab_key=""):
         premium = f"${row['Premium Collected']:.2f}"
         pnl = f"${row['P&L']:.2f}" if pd.notna(row['P&L']) else "$0.00"
         
-        # Expiration/Close Date & Days Left logic
         if row['Status'] == 'Open':
             exp_close = row['Expiration Date'].strftime('%Y-%m-%d') if pd.notna(row['Expiration Date']) else "-"
             days_left = (row['Expiration Date'] - today).days if pd.notna(row['Expiration Date']) else 0
@@ -382,7 +403,6 @@ def display_custom_table(filtered_df, tab_key=""):
             
         status = row['Status']
 
-        # Write Data to Columns
         cols[0].write(open_d)
         cols[1].write(ticker)
         cols[2].write(strategy)
@@ -394,7 +414,6 @@ def display_custom_table(filtered_df, tab_key=""):
         cols[8].write(days_str)
         cols[9].write(status)
         
-        # Draw Action Buttons (Gear and Bin) - ADDED tab_key to keys
         with cols[10]:
             btn_col1, btn_col2 = st.columns(2)
             if btn_col1.button("⚙️", key=f"edit_{tab_key}_{i}", help="Edit Trade"):
@@ -403,12 +422,11 @@ def display_custom_table(filtered_df, tab_key=""):
                 st.rerun()
             if btn_col2.button("🗑️", key=f"del_{tab_key}_{i}", help="Delete Trade"):
                 st.session_state.trades = st.session_state.trades.drop(i)
-                st.session_state.trades.to_csv(FILE_NAME, index=False)
+                save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
                 st.rerun()
         
         st.markdown("<hr style='margin: 0px; padding: 0px;'>", unsafe_allow_html=True)
 
-# ADDED unique tab_keys to the function calls
 with tabs[0]: display_custom_table(df, "all")
 with tabs[1]: display_custom_table(df[df['Status'] == 'Open'], "open")
 with tabs[2]: display_custom_table(df[df['Status'] == 'Assigned'], "assigned")
