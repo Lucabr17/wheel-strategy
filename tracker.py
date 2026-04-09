@@ -3,51 +3,60 @@ import pandas as pd
 from datetime import date
 import numpy as np
 import yfinance as yf 
-import gspread # NEW: Google Sheets Library
-import json # NEW: To read the secrets
+import gspread 
+import json 
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Wheel Strategy Log", layout="wide") 
 
-# --- NEW: GOOGLE SHEETS SETUP ---
-# Connect to Google Sheets using the Streamlit Secrets
+# --- GOOGLE SHEETS SETUP ---
 @st.cache_resource
 def init_gsheets():
     creds_dict = json.loads(st.secrets["gcp_service_account"])
     gc = gspread.service_account_from_dict(creds_dict)
-    sh = gc.open("Wheel Trades Database")
+    sh = gc.open("Wheel Trades Database") # Ensure your sheet is named exactly this
     return sh.sheet1
 
 worksheet = init_gsheets()
 
-# Function to save data back to Google Sheets
+# --- NEW: STRICT DATA TYPE ENFORCER ---
+def enforce_dtypes(df):
+    """Forces Pandas to use the correct data types to prevent crash errors."""
+    for col in ['Open Date', 'Expiration Date', 'Close Date']:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+    for col in ['Strike Price', 'Premium Collected', 'Cost Basis', 'P&L']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+    if '# Contracts' in df.columns:
+        df['# Contracts'] = pd.to_numeric(df['# Contracts'], errors='coerce').fillna(1).astype(int)
+    return df
+
 def save_to_cloud(df):
     df_save = df.copy()
-    # Google Sheets doesn't like NaN/NaT, so we replace them with empty strings
     df_save = df_save.fillna("")
     for col in ['Open Date', 'Expiration Date', 'Close Date']:
-        df_save[col] = df_save[col].astype(str).replace('NaT', '')
+        df_save[col] = df_save[col].dt.strftime('%Y-%m-%d').replace('NaT', '')
     
     worksheet.clear()
-    # Update the sheet with headers + data
     worksheet.update(values=[df_save.columns.values.tolist()] + df_save.values.tolist(), range_name='A1')
 
 # --- INITIALIZE DATA FROM CLOUD ---
 if 'trades' not in st.session_state:
-    records = worksheet.get_all_records()
-    if records: 
-        loaded_df = pd.DataFrame(records)
-        # Convert empty strings back to Pandas empty values
-        loaded_df.replace("", np.nan, inplace=True)
-        for col in ['Open Date', 'Expiration Date', 'Close Date']:
-            loaded_df[col] = pd.to_datetime(loaded_df[col])
-        st.session_state.trades = loaded_df
-    else: 
-        st.session_state.trades = pd.DataFrame(columns=[
+    try:
+        records = worksheet.get_all_records()
+        if records: 
+            loaded_df = pd.DataFrame(records)
+            loaded_df.replace("", np.nan, inplace=True)
+            loaded_df = enforce_dtypes(loaded_df) # Applies the fix here
+            st.session_state.trades = loaded_df
+        else: 
+            raise ValueError("Empty Sheet")
+    except:
+        empty_df = pd.DataFrame(columns=[
             'Open Date', 'Ticker', 'Strategy', 'Strike Price', '# Contracts', 
             'Premium Collected', 'Cost Basis', 'Expiration Date', 'Status', 
             'Close Date', 'P&L', 'Notes'
         ])
+        st.session_state.trades = enforce_dtypes(empty_df)
 
 if 'show_form' not in st.session_state:
     st.session_state.show_form = False
@@ -60,32 +69,32 @@ changed = False
 today = pd.to_datetime(date.today())
 
 for idx, row in st.session_state.trades.iterrows():
-    if row['Status'] == 'Open' and pd.to_datetime(row['Expiration Date']) <= today:
+    if row['Status'] == 'Open' and pd.notna(row['Expiration Date']) and row['Expiration Date'] <= today:
         try:
             ticker_data = yf.Ticker(row['Ticker'])
             current_price = ticker_data.history(period="1d")['Close'].iloc[-1]
             
             if row['Strategy'] == 'Cash-Secured Put':
                 if current_price < row['Strike Price']:
-                    st.session_state.trades.at[idx, 'Status'] = 'Assigned'
+                    st.session_state.trades.loc[idx, 'Status'] = 'Assigned'
                 else:
-                    st.session_state.trades.at[idx, 'Status'] = 'Expired'
+                    st.session_state.trades.loc[idx, 'Status'] = 'Expired'
             
             elif row['Strategy'] == 'Covered Call':
                 if current_price > row['Strike Price']:
-                    st.session_state.trades.at[idx, 'Status'] = 'Assigned' 
+                    st.session_state.trades.loc[idx, 'Status'] = 'Assigned' 
                 else:
-                    st.session_state.trades.at[idx, 'Status'] = 'Expired'
+                    st.session_state.trades.loc[idx, 'Status'] = 'Expired'
             
-            st.session_state.trades.at[idx, 'P&L'] = row['Premium Collected']
-            st.session_state.trades.at[idx, 'Close Date'] = row['Expiration Date']
+            st.session_state.trades.loc[idx, 'P&L'] = float(row['Premium Collected'])
+            st.session_state.trades.loc[idx, 'Close Date'] = row['Expiration Date']
             changed = True
             
-        except Exception as e:
+        except Exception:
             pass 
 
 if changed:
-    save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
+    save_to_cloud(st.session_state.trades)
 
 df = st.session_state.trades
 
@@ -172,18 +181,18 @@ if st.session_state.show_form:
     if st.session_state.edit_idx is not None:
         edit_row = st.session_state.trades.loc[st.session_state.edit_idx]
         def_ticker = edit_row['Ticker']
-        def_strike = float(edit_row['Strike Price'])
-        def_premium = float(edit_row['Premium Collected'])
-        def_open_date = pd.to_datetime(edit_row['Open Date']).date()
+        def_strike = float(edit_row['Strike Price']) if pd.notna(edit_row['Strike Price']) else 0.0
+        def_premium = float(edit_row['Premium Collected']) if pd.notna(edit_row['Premium Collected']) else 0.0
+        def_open_date = pd.to_datetime(edit_row['Open Date']).date() if pd.notna(edit_row['Open Date']) else date.today()
         def_status = edit_row['Status']
         def_pnl = float(edit_row['P&L']) if pd.notna(edit_row['P&L']) else 0.0
         def_strategy = edit_row['Strategy']
-        def_contracts = int(edit_row['# Contracts'])
+        def_contracts = int(edit_row['# Contracts']) if pd.notna(edit_row['# Contracts']) else 1
         def_cost = float(edit_row['Cost Basis']) if pd.notna(edit_row['Cost Basis']) else 0.0
-        def_exp_date = pd.to_datetime(edit_row['Expiration Date']).date()
+        def_exp_date = pd.to_datetime(edit_row['Expiration Date']).date() if pd.notna(edit_row['Expiration Date']) else date.today()
         if pd.notna(edit_row['Close Date']):
             def_close_date = pd.to_datetime(edit_row['Close Date']).date()
-        def_notes = edit_row['Notes'] if pd.notna(edit_row['Notes']) else ""
+        def_notes = str(edit_row['Notes']) if pd.notna(edit_row['Notes']) else ""
 
     with st.form("new_trade_form"):
         c1, c2 = st.columns(2)
@@ -224,38 +233,41 @@ if st.session_state.show_form:
                 open_dt = pd.to_datetime(open_date)
                 ticker_upper = ticker.upper()
                 
+                # We use .loc to prevent pandas TypeErrors during assignment
                 if st.session_state.edit_idx is not None:
                     idx = st.session_state.edit_idx
-                    st.session_state.trades.at[idx, 'Open Date'] = open_dt
-                    st.session_state.trades.at[idx, 'Ticker'] = ticker_upper
-                    st.session_state.trades.at[idx, 'Strategy'] = strategy
-                    st.session_state.trades.at[idx, 'Strike Price'] = strike
-                    st.session_state.trades.at[idx, '# Contracts'] = contracts
-                    st.session_state.trades.at[idx, 'Premium Collected'] = premium
-                    st.session_state.trades.at[idx, 'Cost Basis'] = cost_basis
-                    st.session_state.trades.at[idx, 'Expiration Date'] = pd.to_datetime(exp_date)
-                    st.session_state.trades.at[idx, 'Status'] = status
-                    st.session_state.trades.at[idx, 'Close Date'] = pd.to_datetime(close_date) if close_date else pd.NaT
-                    st.session_state.trades.at[idx, 'P&L'] = pnl
-                    st.session_state.trades.at[idx, 'Notes'] = notes
+                    st.session_state.trades.loc[idx, 'Open Date'] = open_dt
+                    st.session_state.trades.loc[idx, 'Ticker'] = ticker_upper
+                    st.session_state.trades.loc[idx, 'Strategy'] = strategy
+                    st.session_state.trades.loc[idx, 'Strike Price'] = float(strike)
+                    st.session_state.trades.loc[idx, '# Contracts'] = int(contracts)
+                    st.session_state.trades.loc[idx, 'Premium Collected'] = float(premium)
+                    st.session_state.trades.loc[idx, 'Cost Basis'] = float(cost_basis)
+                    st.session_state.trades.loc[idx, 'Expiration Date'] = pd.to_datetime(exp_date)
+                    st.session_state.trades.loc[idx, 'Status'] = status
+                    st.session_state.trades.loc[idx, 'Close Date'] = pd.to_datetime(close_date) if close_date else pd.NaT
+                    st.session_state.trades.loc[idx, 'P&L'] = float(pnl)
+                    st.session_state.trades.loc[idx, 'Notes'] = notes
                 else:
                     new_data = {
                         'Open Date': open_dt,
                         'Ticker': ticker_upper,
                         'Strategy': strategy,
-                        'Strike Price': strike,
-                        '# Contracts': contracts,
-                        'Premium Collected': premium,
-                        'Cost Basis': cost_basis,
+                        'Strike Price': float(strike),
+                        '# Contracts': int(contracts),
+                        'Premium Collected': float(premium),
+                        'Cost Basis': float(cost_basis),
                         'Expiration Date': pd.to_datetime(exp_date),
                         'Status': status,
                         'Close Date': pd.to_datetime(close_date) if close_date else pd.NaT,
-                        'P&L': pnl,
+                        'P&L': float(pnl),
                         'Notes': notes
                     }
-                    st.session_state.trades = pd.concat([st.session_state.trades, pd.DataFrame([new_data])], ignore_index=True)
+                    new_df = pd.DataFrame([new_data])
+                    st.session_state.trades = pd.concat([st.session_state.trades, new_df], ignore_index=True)
                 
-                save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
+                st.session_state.trades = enforce_dtypes(st.session_state.trades) # Double check types before saving
+                save_to_cloud(st.session_state.trades) 
                 st.session_state.edit_idx = None
                 st.session_state.show_form = False
                 st.rerun()
@@ -317,9 +329,9 @@ with m1:
 with m2:
     st.markdown(f"**📈 TOTAL P&L (Options + Shares)**<br><span style='color:{get_color(grand_total_pl)}; font-size: 2.2rem; font-weight: bold;'>${grand_total_pl:,.2f}</span>", unsafe_allow_html=True)
     st.write("") 
-    st.metric(label="📉 WIN RATE", value=f"{win_rate:.1f}%" if not df.empty and len(closed_trades) > 0 else "—", help="Assignments and trades with P&L <= $0 count as losses.")
+    st.metric(label="📉 WIN RATE", value=f"{win_rate:.1f}%" if not df.empty and len(closed_trades) > 0 else "—")
 with m3:
-    st.metric(label="🚀 AVG ANNUAL ROC", value=f"{avg_annual_roc * 100:.1f}%" if roc_list else "—", help="Average return on capital, annualized based on days held.")
+    st.metric(label="🚀 AVG ANNUAL ROC", value=f"{avg_annual_roc * 100:.1f}%" if roc_list else "—")
     st.write("") 
 
 st.divider()
@@ -380,7 +392,7 @@ def display_custom_table(filtered_df, tab_key=""):
     for i, row in filtered_df.iterrows():
         cols = st.columns([1.2, 1, 1.3, 1.2, 1.2, 1.2, 1.2, 1.5, 1, 1.2, 1.2])
         
-        open_d = row['Open Date'].strftime('%Y-%m-%d')
+        open_d = row['Open Date'].strftime('%Y-%m-%d') if pd.notna(row['Open Date']) else "-"
         ticker = row['Ticker']
         strategy = "CSP" if row['Strategy'] == "Cash-Secured Put" else "CC"
         strike = f"${row['Strike Price']:.2f}"
@@ -398,7 +410,12 @@ def display_custom_table(filtered_df, tab_key=""):
             days_left = (row['Expiration Date'] - today).days if pd.notna(row['Expiration Date']) else 0
             days_str = str(days_left) if days_left >= 0 else "Exp"
         else:
-            exp_close = row['Close Date'].strftime('%Y-%m-%d') if pd.notna(row['Close Date']) else row['Expiration Date'].strftime('%Y-%m-%d')
+            if pd.notna(row['Close Date']):
+                exp_close = row['Close Date'].strftime('%Y-%m-%d')
+            elif pd.notna(row['Expiration Date']):
+                exp_close = row['Expiration Date'].strftime('%Y-%m-%d')
+            else:
+                exp_close = "-"
             days_str = "-"
             
         status = row['Status']
@@ -422,7 +439,7 @@ def display_custom_table(filtered_df, tab_key=""):
                 st.rerun()
             if btn_col2.button("🗑️", key=f"del_{tab_key}_{i}", help="Delete Trade"):
                 st.session_state.trades = st.session_state.trades.drop(i)
-                save_to_cloud(st.session_state.trades) # NEW: Saves to Cloud
+                save_to_cloud(st.session_state.trades) 
                 st.rerun()
         
         st.markdown("<hr style='margin: 0px; padding: 0px;'>", unsafe_allow_html=True)
@@ -443,9 +460,11 @@ years_to_show = [2026]
 months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 if not df.empty:
+    # Ensure dates are datetime right before pulling the year to be extra safe
+    df['Open Date'] = pd.to_datetime(df['Open Date'], errors='coerce') 
     trade_years = df['Open Date'].dt.year.dropna().unique().tolist()
     for y in trade_years:
-        if y not in years_to_show:
+        if int(y) not in years_to_show:
             years_to_show.append(int(y))
 
 years_to_show.sort()
@@ -458,7 +477,7 @@ if not df.empty:
         realized_df['Month'] = realized_df['Open Date'].dt.strftime('%b')
         for index, row in realized_df.iterrows():
             if pd.notna(row['Year']) and pd.notna(row['Month']):
-                gains_data.at[row['Year'], row['Month']] += row['P&L']
+                gains_data.at[row['Year'], row['Month']] += float(row['P&L'])
 
 gains_data['Yearly Total'] = gains_data.sum(axis=1)
 
