@@ -32,12 +32,28 @@ def enforce_dtypes(df):
 
 def save_to_cloud(df):
     df_save = df.copy()
-    df_save = df_save.fillna("")
+    
+    # 1. Format dates FIRST (before filling NaNs)
     for col in ['Open Date', 'Expiration Date', 'Close Date']:
         df_save[col] = df_save[col].dt.strftime('%Y-%m-%d').replace('NaT', '')
+        
+    # 2. Replace any weird infinities or standard NaNs
+    df_save = df_save.replace([np.inf, -np.inf], "")
+    df_save = df_save.fillna("")
     
+    # 3. Create the headers and data rows
+    headers = df_save.columns.values.tolist()
+    data_rows = df_save.values.tolist()
+    
+    # 4. Final aggressive scrub: Catch any microscopic NaN floats that slipped through
+    clean_data = [headers]
+    for row in data_rows:
+        # If an item is still recognized as "isna" by pandas, force it to an empty string
+        clean_row = ["" if pd.isna(x) else x for x in row]
+        clean_data.append(clean_row)
+        
     worksheet.clear()
-    worksheet.update(values=[df_save.columns.values.tolist()] + df_save.values.tolist(), range_name='A1')
+    worksheet.update(values=clean_data, range_name='A1')
 
 # --- INITIALIZE DATA FROM CLOUD ---
 if 'trades' not in st.session_state:
